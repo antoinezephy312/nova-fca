@@ -2,17 +2,66 @@
  /* eslint-disable no-prototype-builtins */
 "use strict";
 
-let request = require("request").defaults({ jar: true });
+const axios = require("axios");
+const { wrapper } = require("axios-cookiejar-support");
+const { CookieJar } = require("tough-cookie");
+const FormData = require("form-data");
+const HttpsProxyAgent = require("https-proxy-agent");
 const stream = require("stream");
 const querystring = require("querystring");
 const url = require("url");
 
+let httpClient = createHttpClient();
+
+function createJar() {
+	const jar = new CookieJar();
+	const setCookieSync = jar.setCookieSync.bind(jar);
+	const getCookiesSync = jar.getCookiesSync.bind(jar);
+
+	jar.setCookie = function (cookie, cookieUrl, options, cb) {
+		let result;
+		try {
+			result = setCookieSync(cookie, cookieUrl, options);
+		} catch (err) {
+			if (typeof cb === "function") return cb(err);
+			throw err;
+		}
+		if (typeof cb === "function") return cb(null, result);
+		return result;
+	};
+
+	jar.getCookies = function (cookieUrl, options, cb) {
+		let result;
+		try {
+			result = getCookiesSync(cookieUrl, options);
+		} catch (err) {
+			if (typeof cb === "function") return cb(err);
+			throw err;
+		}
+		if (typeof cb === "function") return cb(null, result);
+		return result;
+	};
+
+	return jar;
+}
+
+function createHttpClient(proxy) {
+	const client = axios.create({
+		timeout: 60000,
+		decompress: true,
+		validateStatus: () => true,
+		proxy: false
+	});
+
+	if (proxy) {
+		client.defaults.httpsAgent = new HttpsProxyAgent(proxy);
+	}
+
+	return wrapper(client);
+}
+
 function setProxy(proxy) {
-  if (typeof proxy == 'string')
-    request = require("request").defaults({ jar: !0, proxy });
-  else 
-    request = require('request').defaults({ jar: !0 });
-  return;
+	httpClient = createHttpClient(typeof proxy === "string" ? proxy : null);
 }
 
 function getHeaders(url, options, ctx, customHeader) {
@@ -41,25 +90,50 @@ function isReadableStream(obj) {
 	return obj instanceof stream.Stream && typeof obj._read == "function" && getType(obj._readableState) == "Object";
 }
 
+function normalizeObjectValues(obj) {
+	if (getType(obj) != "Object") return obj;
+	for (let prop in obj) {
+		if (getType(obj[prop]) == "Object") {
+			obj[prop] = JSON.stringify(obj[prop]);
+		}
+	}
+	return obj;
+}
+
+function buildResponse(res, requestMeta) {
+	const body = Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data || "");
+	return {
+		statusCode: res.status,
+		body,
+		headers: res.headers,
+		request: requestMeta
+	};
+}
+
 function get(url, jar, qs, options, ctx, customHeader) {
 	let callback;
   var returnPromise = new Promise(function (resolve, reject) {
     callback = (error, res) => error ? reject(error) : resolve(res);
   });
-	if (getType(qs) == "Object") 
-    for (let prop in qs) {
-      if (getType(qs[prop]) == 'Object')
-        qs[prop] = JSON.stringify(qs[prop]);
-    }
-	var op = {
-    headers: getHeaders(url, options, ctx, customHeader),
-		timeout: 60000,
-		qs,
-		jar,
-		gzip: !0
-	}
 
-  request.get(url, op, callback);
+	normalizeObjectValues(qs);
+	const headers = getHeaders(url, options, ctx, customHeader);
+	const requestMeta = {
+		method: "GET",
+		uri: new URL(url),
+		headers,
+		formData: null
+	};
+
+	httpClient
+		.get(url, {
+			headers,
+			params: qs || undefined,
+			jar,
+			responseType: "arraybuffer"
+		})
+		.then((res) => callback(null, buildResponse(res, requestMeta)))
+		.catch((err) => callback(err));
 
   return returnPromise;
 }
@@ -69,16 +143,24 @@ function post(url, jar, form, options, ctx, customHeader) {
   var returnPromise = new Promise(function (resolve, reject) {
     callback = (error, res) => error ? reject(error) : resolve(res);
   });
-  
-	var op = {
-    headers: getHeaders(url, options, ctx, customHeader),
-    timeout: 60000,
-		form,
-		jar,
-		gzip: !0
-	}
 
-  request.post(url, op, callback);
+	normalizeObjectValues(form);
+	const headers = getHeaders(url, options, ctx, customHeader);
+	const requestMeta = {
+		method: "POST",
+		uri: new URL(url),
+		headers,
+		formData: form
+	};
+
+	httpClient
+		.post(url, querystring.stringify(form || {}), {
+			headers,
+			jar,
+			responseType: "arraybuffer"
+		})
+		.then((res) => callback(null, buildResponse(res, requestMeta)))
+		.catch((err) => callback(err));
 
 	return returnPromise;
 }
@@ -88,23 +170,48 @@ function postFormData(url, jar, form, qs, options, ctx) {
   var returnPromise = new Promise(function (resolve, reject) {
     callback = (error, res) => error ? reject(error) : resolve(res);
   });
-  if (getType(qs) == "Object") 
-    for (let prop in qs) {
-      if (getType(qs[prop]) == 'Object')
-        qs[prop] = JSON.stringify(qs[prop]);
-    }
-	var op = {
-		headers: getHeaders(url, options, ctx, {
-      'Content-Type': 'multipart/form-data'
-    }),
-		timeout: 60000,
-		formData: form,
-		qs,
-		jar,
-		gzip: !0
+
+	normalizeObjectValues(qs);
+	const formData = new FormData();
+	if (getType(form) == "Object") {
+		Object.keys(form).forEach((key) => {
+			const value = form[key];
+			if (Array.isArray(value)) {
+				value.forEach((entry) => formData.append(key, entry));
+			} else if (getType(value) == "Object") {
+				formData.append(key, JSON.stringify(value));
+			} else {
+				formData.append(key, value);
+			}
+		});
 	}
 
-  request.post(url, op, callback);
+	const headers = Object.assign(
+		{},
+		getHeaders(url, options, ctx, null),
+		formData.getHeaders()
+	);
+	if (headers["content-type"] && !headers["Content-Type"]) {
+		headers["Content-Type"] = headers["content-type"];
+	}
+
+	const requestMeta = {
+		method: "POST",
+		uri: new URL(url),
+		headers,
+		formData: form
+	};
+
+	httpClient
+		.post(url, formData, {
+			headers,
+			params: qs || undefined,
+			jar,
+			maxBodyLength: Infinity,
+			responseType: "arraybuffer"
+		})
+		.then((res) => callback(null, buildResponse(res, requestMeta)))
+		.catch((err) => callback(err));
 
 	return returnPromise;
 }
@@ -1346,7 +1453,7 @@ module.exports = {
 	makeParsable,
 	arrToForm,
 	getSignatureID,
-	getJar: request.jar,
+	getJar: createJar,
 	generateTimestampRelative,
 	makeDefaults,
 	parseAndCheckLogin,
